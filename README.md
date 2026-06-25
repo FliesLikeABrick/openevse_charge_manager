@@ -4,7 +4,7 @@ A cron-driven Python script for managing charge sessions on an OpenEVSE EVSE, wr
 
 ## Why I wrote this
 
-The early Nissan Leaf (roughly 2011–2017, depending on trim) has no way to set a maximum state of charge, no onboard charge scheduling, and no temperature-aware charge management. This matters because the Leaf uses a passively air-cooled battery pack that is well-documented to degrade faster when repeatedly charged to 100% SOC and when charged in high ambient temperatures. The car will happily charge to full regardless of how hot it is outside or how full the battery already is — there is no way to tell it otherwise from inside the car.
+The early Nissan Leaf (roughly 2011–2016) has no way to set a maximum state of charge, no onboard charge scheduling, and no temperature-aware charge management. This matters because the Leaf uses a passively air-cooled battery pack that is well-documented to degrade faster when repeatedly charged to 100% SOC and when charged in high ambient temperatures. The car will happily charge to full regardless of how hot it is outside or how full the battery already is — there is no way to tell it otherwise from inside the car.
 
 I built this script to fill that gap using my OpenEVSE EVSE, which exposes a local HTTP API that makes it possible to control and monitor charging programmatically from anything on the local network.
 
@@ -16,7 +16,7 @@ The script runs as a cron job every 1–2 minutes and enforces two conditions:
 
 **Low-current cutoff.** If the car is connected and actively charging but the measured charge current drops below a configurable threshold (I use 10A), the script disables the EVSE. My Leaf charges at roughly 27A during the constant-current phase of a charge session. When current starts tapering, the car has entered the CV (constant voltage / absorption) phase, which corresponds to the battery approaching a full charge. By cutting off at 10A I stop the session before the battery reaches 100% SOC. The car does not have an onboard way to set a charge limit, so this is my workaround.
 
-Once the EVSE has been disabled by the low-current cutoff, it stays disabled until the car is physically unplugged. On the next plug-in, the script re-arms automatically and a new session proceeds normally. This is intentional — I don't want the EVSE to re-enable mid-session after cutting off.
+Once the EVSE has been disabled by the low-current cutoff, it stays disabled until the car is physically unplugged. At that point the script clears the override automatically, so the EVSE is ready for the next session without any manual intervention. This is intentional — I don't want the EVSE to re-enable mid-session after cutting off.
 
 ## How it works
 
@@ -27,7 +27,7 @@ The script uses two data sources on each run:
 
 Control actions are taken via the OpenEVSE `/override` endpoint, which accepts `{"state": "disabled"}` to stop output and is cleared with a DELETE request to re-enable normal operation. The override layer sits above the EVSE's internal scheduler, so it doesn't interfere with any charge timers you may have configured.
 
-A small JSON state file (`/tmp/evse_manager_state.json`) persists between runs so the script knows whether it was the thing that disabled the EVSE, what the reason was, and whether a charge session is currently in progress. This prevents the script from clearing a disable that was set manually via the OpenEVSE web UI, and correctly handles the re-arm logic after a low-current cutoff.
+A small JSON state file (`/tmp/evse_manager_state.json`) persists between runs so the script knows whether it was the thing that disabled the EVSE and what the reason was. This prevents the script from clearing a disable that was set manually via the OpenEVSE web UI, and correctly handles the re-arm logic after a low-current cutoff.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ A small JSON state file (`/tmp/evse_manager_state.json`) persists between runs s
    ```
    pip install requests
    ```
-3. Edit the configuration block at the top of `evse_charge_manager.py`:
+3. Edit the configuration block at the top of `openevse_charge_manager.py`:
    ```python
    OPENEVSE_HOST = "192.168.1.100"   # IP or hostname of your OpenEVSE
    OPENEVSE_USER = ""                 # only if HTTP auth is enabled
@@ -58,40 +58,23 @@ A small JSON state file (`/tmp/evse_manager_state.json`) persists between runs s
    ```
 4. Test it manually first:
    ```
-   python3 evse_charge_manager.py
+   python3 openevse_charge_manager.py
    ```
 5. Add to crontab once satisfied:
    ```
-   */2 * * * * /usr/bin/python3 /path/to/evse_charge_manager.py >> /var/log/evse_manager.log 2>&1
+   */2 * * * * /usr/bin/python3 /path/to/openevse_charge_manager.py >> /var/log/evse_manager.log 2>&1
    ```
 
 ## Adapting the temperature source
 
 The temperature gate is built around the Weather Underground PWS API because that's what I have, but `get_outdoor_temp_f()` is deliberately isolated — it just needs to return a float in degrees Fahrenheit. If you have a different temperature source, replace the function body with whatever makes sense for your setup. Some examples:
 
-**Local sensor (e.g. a DHT22 or BME280 on a Raspberry Pi):**
-
-SHT35 would be similar
+**Local sensor (e.g. a DHT22, BME280, or SHT35 on a Raspberry Pi):**
 ```python
 def get_outdoor_temp_f() -> float:
     # Read from your sensor library of choice and return °F
     temp_c = my_sensor.read_temperature()
     return (temp_c * 9 / 5) + 32
-```
-
-**Home Assistant REST API:**
-
-This is a guess based on my understanding of how Home Assistant works for those who use it.
-
-```python
-def get_outdoor_temp_f() -> float:
-    resp = requests.get(
-        "http://homeassistant.local:8123/api/states/sensor.outdoor_temperature",
-        headers={"Authorization": "Bearer YOUR_HA_LONG_LIVED_TOKEN"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return float(resp.json()["state"])
 ```
 
 **A fixed value (effectively disables the temperature gate):**
@@ -117,13 +100,22 @@ If you only want the temperature gate, set `AMP_CUTOFF_A` to `0.0`. Since measur
 
 ## A note on the low-current threshold
 
-The 10A default reflects my specific car (a 2016 Nissan Leaf 30kwh) charging on a 240V Level 2 circuit, where the constant-current phase runs at approximately 27A. The right value for your situation depends on your car's charge rate and how conservatively you want to cut off. Setting it too high risks cutting off before the battery is at a useful charge level; setting it too low risks letting the CV phase run long enough to bring SOC close to 100% anyway. I'd suggest logging a few complete sessions and looking at where current starts to taper before committing to a threshold.
+The 10A default reflects my specific car (a 2016 Nissan Leaf) charging on a 240V Level 2 circuit, where the constant-current phase runs at approximately 27A. The right value for your situation depends on your car's charge rate and how conservatively you want to cut off. Setting it too high risks cutting off before the battery is at a useful charge level; setting it too low risks letting the CV phase run long enough to bring SOC close to 100% anyway. I'd suggest logging a few complete sessions and looking at where current starts to taper before committing to a threshold.
 
 ## Caveats
 
 - The script has no way to know the actual battery SOC — it infers "approaching full" from current taper, which is a reasonable but imperfect proxy.
-- If the EVSE is rebooted or the override is cleared manually while the script has a disable in effect, the state file may become stale. The script includes a reconciliation check that detects this condition (override gone but state file still says disabled) and resets gracefully on the next run.
+- If the EVSE is rebooted or the override is cleared manually while the script has a disable in effect, the state file may become stale. On the next run the script will see that no override is active on the EVSE despite the state file saying otherwise, and will reset the state file automatically.
 - The `vehicle` field in the OpenEVSE status response has been unreliable in some firmware versions and hardware configurations. If you find that the low-current re-arm after unplug is not working, check whether `/status` correctly shows `"vehicle": 1` while a car is connected and `"vehicle": 0` after unplugging. If not, the proximity/pilot wiring to the handle switch is the first place to look.
 
-- Other EVSEs with local APIs
-This script is written for OpenEVSE, but the logic is straightforward enough that someone comfortable with Python could adapt it for other EVSEs that expose a local HTTP API; for example, SmartEVSE
+## Other EVSEs with local APIs
+
+This script is written for OpenEVSE, but the logic is straightforward enough that someone comfortable with Python could adapt it for other EVSEs that expose a local HTTP API. Two other options worth knowing about:
+
+**SmartEVSE v3 / v3.5**
+
+The SmartEVSE-3 is an open-source EVSE with open-source firmware that exposes a REST API at `/settings` for both reading status and writing control values. The equivalent of this script's disable/enable override would use the mode endpoint to switch between Normal and Pause modes — Pause stops charging while keeping the pilot signal alive, which is meaningfully different from OpenEVSE's override layer. There is also an actively maintained community fork called SmartEVSE-3.5 (`dingo35/SmartEVSE-3.5`) which is ahead of the original repository. One caveat from the community: the device can lock up if you make too many REST API requests in quick succession, so a 2-minute cron interval is probably more appropriate than a faster one.
+
+**evcc**
+
+evcc is an open-source EV charge controller that supports a wide range of chargers. Rather than adapting this script, an evcc user would likely implement the charge management logic inside evcc's own configuration. It's a different philosophy — evcc is a full charge management system rather than a thin control layer — but worth knowing about if you want something with a larger feature set and broader hardware support out of the box.
